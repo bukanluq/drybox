@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sensor Monitor</title>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
 <style>
 *{
     margin:0;
@@ -235,6 +237,17 @@ hr{
     margin-top:10px;
     line-height:1.4;
 }
+
+.configWarning{
+    max-width:320px;
+    border:2px solid #d9483b;
+    color:#d9483b;
+    padding:12px;
+    font-size:13px;
+    margin-bottom:20px;
+    display:none;
+    text-align:center;
+}
 </style>
 </head>
 
@@ -243,6 +256,10 @@ hr{
 <!-- HOME PAGE -->
 <div id="home" class="page active" style="justify-content:center;">
     <h1>Sensor Monitor</h1>
+
+    <div class="configWarning" id="configWarning">
+        Supabase isn't configured yet. Edit SUPABASE_URL and SUPABASE_ANON_KEY near the top of the &lt;script&gt; tag.
+    </div>
 
     <button onclick="showPage('registerPage'); resetRegisterForm();">REGISTER</button>
     <button onclick="showPage('checkPage'); loadSavedData();">CHECK</button>
@@ -266,7 +283,7 @@ hr{
 
     <img id="photoPreview" alt="Photo preview">
 
-    <button onclick="registerItem()">REGISTER</button>
+    <button id="registerButton" onclick="registerItem()">REGISTER</button>
 
     <button onclick="showPage('home')">HOME</button>
 
@@ -325,6 +342,18 @@ hr{
 </div>
 
 <script>
+/* ---------- SUPABASE CONFIG - fill these in ---------- */
+const SUPABASE_URL = "YOUR_SUPABASE_PROJECT_URL";       // e.g. "https://xxxxxxxx.supabase.co"
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";     // Project Settings -> API -> anon public key
+const PHOTOS_BUCKET = "item-photos";
+
+const supabaseConfigured = SUPABASE_URL.startsWith("http") && SUPABASE_ANON_KEY.length > 20;
+const supabaseClient = supabaseConfigured ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+if(!supabaseConfigured){
+    document.getElementById("configWarning").style.display = "block";
+}
+
 function showPage(id){
     document.querySelectorAll(".page").forEach(page=>{
         page.classList.remove("active");
@@ -332,9 +361,12 @@ function showPage(id){
     document.getElementById(id).classList.add("active");
 }
 
-let items = JSON.parse(localStorage.getItem("registeredItems")) || [];
+let items = [];
 let currentIndex = 0;
-let currentPhotoDataUrl = null;
+
+function formatItemId(numericId){
+    return "ITM-" + String(numericId).padStart(4, "0");
+}
 
 /* ---------- REGISTER PAGE ---------- */
 
@@ -346,7 +378,6 @@ function resetRegisterForm(){
     document.getElementById("photoPreview").style.display = "none";
     document.getElementById("photoPreview").src = "";
     document.getElementById("photoBtnLabel").textContent = "ADD PHOTO";
-    currentPhotoDataUrl = null;
 }
 
 function previewPhoto(event){
@@ -355,53 +386,107 @@ function previewPhoto(event){
 
     const reader = new FileReader();
     reader.onload = function(e){
-        currentPhotoDataUrl = e.target.result;
         const preview = document.getElementById("photoPreview");
-        preview.src = currentPhotoDataUrl;
+        preview.src = e.target.result;
         preview.style.display = "block";
         document.getElementById("photoBtnLabel").textContent = "CHANGE PHOTO";
     };
     reader.readAsDataURL(file);
 }
 
-function generateItemId(){
-    // Auto-assigned, sequential, zero-padded ID for this webapp's own item list, e.g. ITM-0001.
-    // This is separate from the ESP32's own Device ID entered below.
-    const nextNumber = items.length + 1;
-    return "ITM-" + String(nextNumber).padStart(4, "0");
-}
+async function registerItem(){
+    if(!supabaseConfigured){
+        alert("Supabase isn't configured yet - see the warning on the Home page.");
+        return;
+    }
 
-function registerItem(){
     const name = document.getElementById("itemName").value.trim();
     const deviceId = document.getElementById("itemDeviceId").value.trim();
     const devicePassword = document.getElementById("itemDevicePassword").value;
+    const photoFile = document.getElementById("itemPhoto").files[0];
 
     if(name === ""){
         alert("Enter a name for this item.");
         return;
     }
 
-    const newItem = {
-        id: generateItemId(),
-        name: name,
-        deviceId: deviceId || null,               // e.g. "A1B2C3", shown on the device's LCD/setup page
-        devicePassword: devicePassword || null,    // the password set on that device during WiFi setup
-        photo: currentPhotoDataUrl                 // may be null if no photo added
-    };
+    const registerButton = document.getElementById("registerButton");
+    registerButton.disabled = true;
+    registerButton.textContent = "SAVING...";
 
-    items.push(newItem);
-    localStorage.setItem("registeredItems", JSON.stringify(items));
+    try{
+        let photoUrl = null;
 
-    alert("Item Registered: " + newItem.id);
+        if(photoFile){
+            const filePath = Date.now() + "-" + photoFile.name.replace(/\s+/g, "_");
 
-    resetRegisterForm();
-    showPage("home");
+            const { error: uploadError } = await supabaseClient
+                .storage
+                .from(PHOTOS_BUCKET)
+                .upload(filePath, photoFile);
+
+            if(uploadError){
+                alert("Photo upload failed: " + uploadError.message);
+                return;
+            }
+
+            const { data: publicUrlData } = supabaseClient
+                .storage
+                .from(PHOTOS_BUCKET)
+                .getPublicUrl(filePath);
+
+            photoUrl = publicUrlData.publicUrl;
+        }
+
+        const { data, error } = await supabaseClient
+            .from("items")
+            .insert({
+                name: name,
+                device_id: deviceId || null,
+                device_password: devicePassword || null,
+                photo_url: photoUrl
+            })
+            .select()
+            .single();
+
+        if(error){
+            alert("Could not save item: " + error.message);
+            return;
+        }
+
+        alert("Item Registered: " + formatItemId(data.id));
+
+        resetRegisterForm();
+        showPage("home");
+    } finally {
+        registerButton.disabled = false;
+        registerButton.textContent = "REGISTER";
+    }
 }
 
 /* ---------- CHECK PAGE ---------- */
 
-function loadSavedData(){
-    items = JSON.parse(localStorage.getItem("registeredItems")) || [];
+async function loadSavedData(){
+    if(!supabaseConfigured){
+        document.getElementById("displayID").innerHTML = "Not Configured";
+        document.getElementById("displayName").innerHTML = "Set up Supabase first";
+        document.getElementById("cardPhoto").style.display = "none";
+        document.getElementById("noPhoto").style.display = "flex";
+        setLiveUI("none", null, null, null, "");
+        return;
+    }
+
+    const { data, error } = await supabaseClient
+        .from("items")
+        .select("*")
+        .order("id", { ascending: true });
+
+    if(error){
+        alert("Could not load items: " + error.message);
+        items = [];
+    } else {
+        items = data;
+    }
 
     if(items.length === 0){
         document.getElementById("displayID").innerHTML = "No Items";
@@ -419,14 +504,14 @@ function loadSavedData(){
 function displayCurrentDevice(){
     const item = items[currentIndex];
 
-    document.getElementById("displayID").innerHTML = item.id;
+    document.getElementById("displayID").innerHTML = formatItemId(item.id);
     document.getElementById("displayName").innerHTML = item.name;
 
     const cardPhoto = document.getElementById("cardPhoto");
     const noPhoto = document.getElementById("noPhoto");
 
-    if(item.photo){
-        cardPhoto.src = item.photo;
+    if(item.photo_url){
+        cardPhoto.src = item.photo_url;
         cardPhoto.style.display = "block";
         noPhoto.style.display = "none";
     } else {
@@ -455,17 +540,22 @@ function previousDevice(){
     displayCurrentDevice();
 }
 
-function deleteCurrentItem(){
+async function deleteCurrentItem(){
     if(items.length === 0) return;
 
     const item = items[currentIndex];
-    const confirmed = confirm("Delete \"" + item.name + "\" (" + item.id + ")? This cannot be undone.");
+    const confirmed = confirm("Delete \"" + item.name + "\" (" + formatItemId(item.id) + ")? This cannot be undone.");
     if(!confirmed) return;
 
     stopLiveMonitor();
 
+    const { error } = await supabaseClient.from("items").delete().eq("id", item.id);
+    if(error){
+        alert("Could not delete: " + error.message);
+        return;
+    }
+
     items.splice(currentIndex, 1);
-    localStorage.setItem("registeredItems", JSON.stringify(items));
 
     if(items.length === 0){
         currentIndex = 0;
@@ -481,7 +571,7 @@ function deleteCurrentItem(){
     displayCurrentDevice();
 }
 
-/* ---------- LIVE MONITORING (polls the ESP32's /api/data) ---------- */
+/* ---------- LIVE MONITORING (polls the ESP32's /api/data, same network only) ---------- */
 
 let livePollTimer = null;
 const LIVE_POLL_INTERVAL_MS = 3000;
@@ -512,12 +602,12 @@ async function pollLiveData(item){
     const timeout = setTimeout(() => controller.abort(), LIVE_FETCH_TIMEOUT_MS);
 
     try{
-        const host = "esp32-" + item.deviceId.toLowerCase() + ".local";
+        const host = "esp32-" + item.device_id.toLowerCase() + ".local";
         const url = "http://" + host + "/api/data";
 
         const headers = {};
-        if(item.devicePassword){
-            headers["Authorization"] = "Basic " + btoa("admin:" + item.devicePassword);
+        if(item.device_password){
+            headers["Authorization"] = "Basic " + btoa("admin:" + item.device_password);
         }
 
         const response = await fetch(url, { signal: controller.signal, mode: "cors", headers: headers });
@@ -542,15 +632,15 @@ async function pollLiveData(item){
     }catch(err){
         clearTimeout(timeout);
         setLiveUI("offline", null, null, null,
-            "Can't reach the device. Check the Device ID is correct, the device is on the same network, and - if this page is hosted on claude.ai - open the downloaded file directly instead, since the hosted version can't reach local devices.");
+            "Can't reach the device. Make sure this browser is on the same WiFi network as the device, and that the Device ID/password are correct. If the page is loaded over HTTPS, some browsers block this local connection entirely.");
     }
 }
 
 function startLiveMonitor(item){
     stopLiveMonitor();
 
-    if(!item.deviceId){
-        setLiveUI("none", null, null, null, "Add a Device ID (and password) when registering this item to see live data.");
+    if(!item.device_id){
+        setLiveUI("none", null, null, null, "This item has no Device ID linked, so there's no live data to show.");
         return;
     }
 
