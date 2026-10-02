@@ -272,11 +272,7 @@ hr{
 
     <input type="text" id="itemName" placeholder="Enter Name">
 
-    <input type="text" id="itemDeviceId" placeholder="Device ID (e.g. A1B2C3)">
-
-    <input type="password" id="itemDevicePassword" placeholder="Device Password">
-
-    <input type="text" id="itemDeviceIp" placeholder="Device IP (optional, e.g. 192.168.1.50)">
+    <input type="text" id="itemDeviceId" placeholder="Device ID (e.g. A1B2C3, optional)">
 
     <div class="photo-input-wrap">
         <label class="photo-btn" for="itemPhoto" id="photoBtnLabel">ADD PHOTO</label>
@@ -375,8 +371,6 @@ function formatItemId(numericId){
 function resetRegisterForm(){
     document.getElementById("itemName").value = "";
     document.getElementById("itemDeviceId").value = "";
-    document.getElementById("itemDevicePassword").value = "";
-    document.getElementById("itemDeviceIp").value = "";
     document.getElementById("itemPhoto").value = "";
     document.getElementById("photoPreview").style.display = "none";
     document.getElementById("photoPreview").src = "";
@@ -405,8 +399,6 @@ async function registerItem(){
 
     const name = document.getElementById("itemName").value.trim();
     const deviceId = document.getElementById("itemDeviceId").value.trim();
-    const devicePassword = document.getElementById("itemDevicePassword").value;
-    const deviceIp = document.getElementById("itemDeviceIp").value.trim();
     const photoFile = document.getElementById("itemPhoto").files[0];
 
     if(name === ""){
@@ -447,8 +439,6 @@ async function registerItem(){
             .insert({
                 name: name,
                 device_id: deviceId || null,
-                device_password: devicePassword || null,
-                device_ip: deviceIp || null,
                 photo_url: photoUrl
             })
             .select()
@@ -576,11 +566,14 @@ async function deleteCurrentItem(){
     displayCurrentDevice();
 }
 
-/* ---------- LIVE MONITORING (polls the ESP32's /api/data, same network only) ---------- */
+/* ---------- LIVE MONITORING ----------
+   Reads the device_status row the ESP32 itself pushes to Supabase
+   every few seconds. Works from any phone/browser/network, since
+   it's just another Supabase read - no local-network fetch involved. */
 
 let livePollTimer = null;
-const LIVE_POLL_INTERVAL_MS = 3000;
-const LIVE_FETCH_TIMEOUT_MS = 4000;
+const LIVE_POLL_INTERVAL_MS = 4000;
+const STALE_AFTER_MS = 15000; // no update in 15s -> treat as offline
 
 function setLiveUI(state, humidity, humidifierOn, fanOn, note){
     const dot = document.getElementById("statusDot");
@@ -603,49 +596,45 @@ function setLiveUI(state, humidity, humidifierOn, fanOn, note){
 }
 
 async function pollLiveData(item){
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), LIVE_FETCH_TIMEOUT_MS);
+    const { data, error } = await supabaseClient
+        .from("device_status")
+        .select("*")
+        .eq("device_id", item.device_id)
+        .maybeSingle();
 
-    try{
-        const host = item.device_ip ? item.device_ip : ("esp32-" + item.device_id.toLowerCase() + ".local");
-        const url = "http://" + host + "/api/data";
-
-        const headers = {};
-        if(item.device_password){
-            headers["Authorization"] = "Basic " + btoa("admin:" + item.device_password);
-        }
-
-        const response = await fetch(url, { signal: controller.signal, mode: "cors", headers: headers });
-        clearTimeout(timeout);
-
-        if(response.status === 401){
-            setLiveUI("offline", null, null, null, "Incorrect Device ID or password.");
-            return;
-        }
-
-        if(!response.ok) throw new Error("bad response");
-
-        const data = await response.json();
-
-        setLiveUI(
-            "online",
-            data.humidityValid ? data.humidity : null,
-            data.humidifierOn,
-            data.fanOn,
-            data.apMode ? "Device is in WiFi setup mode." : ""
-        );
-    }catch(err){
-        clearTimeout(timeout);
-        setLiveUI("offline", null, null, null,
-            "Can't reach the device. Make sure this browser is on the same WiFi network as the device, and that the Device ID/password are correct. If the page is loaded over HTTPS, some browsers block this local connection entirely.");
+    if(error){
+        setLiveUI("offline", null, null, null, "Could not read device status: " + error.message);
+        return;
     }
+
+    if(!data){
+        setLiveUI("offline", null, null, null, "No status reported yet for this Device ID. Check it's correct and the device has connected at least once.");
+        return;
+    }
+
+    const ageMs = Date.now() - new Date(data.updated_at).getTime();
+
+    if(ageMs > STALE_AFTER_MS){
+        setLiveUI("offline",
+            data.humidity_valid ? data.humidity : null,
+            data.humidifier_on,
+            data.fan_on,
+            "Last update " + Math.round(ageMs / 1000) + "s ago - device may be offline.");
+        return;
+    }
+
+    setLiveUI("online",
+        data.humidity_valid ? data.humidity : null,
+        data.humidifier_on,
+        data.fan_on,
+        data.ap_mode ? "Device is in WiFi setup mode." : "");
 }
 
 function startLiveMonitor(item){
     stopLiveMonitor();
 
-    if(!item.device_id && !item.device_ip){
-        setLiveUI("none", null, null, null, "This item has no Device ID or IP linked, so there's no live data to show.");
+    if(!item.device_id){
+        setLiveUI("none", null, null, null, "Add a Device ID when registering this item to see live data.");
         return;
     }
 
